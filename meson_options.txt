@@ -1,0 +1,2 @@
+option('cpu', type: 'string', value: 'bf3',
+       description: 'Indicates which type of DPA cpu is going to be used.')

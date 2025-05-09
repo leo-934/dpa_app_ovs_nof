@@ -1,0 +1,2 @@
+rm -rf build && meson build && ninja -C build
+./build/packet_processor/host/flexio_packet_processor mlx5_1 1 0 a088c2320440 0 0

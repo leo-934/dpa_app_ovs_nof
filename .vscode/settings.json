@@ -1,0 +1,14 @@
+{
+    "C_Cpp.default.includePath": [
+        "/opt/mellanox/flexio/include/**",
+        "/root/wjn/workspace-packet-processor/dpa_app/**"
+    ],
+    "files.associations": {
+        "array": "c",
+        "string": "c",
+        "string_view": "c",
+        "mman.h": "c",
+        "functional": "c"
+    },
+    "mesonbuild.configureOnOpen": false
+}
