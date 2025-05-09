@@ -21,7 +21,7 @@
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
  * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMEpNT OF SUBSTITUTE GOODS OR
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
  * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
  * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
@@ -55,6 +55,10 @@
 /* Mask for data index */
 #define DATA_IDX_MASK ((1 << (LOG_SQ_DEPTH)) - 1)
 
+#define ACK_MSG_SIZE 64
+
+#define ETH_HEADER_SIZE 42
+
 /* The structure of the sample DPA application contains global data that the application uses */
 static struct dpa_thread_context {
 	/* Packet count - used for debug message */
@@ -64,6 +68,8 @@ static struct dpa_thread_context {
 	uint32_t rq_lkey;
 	int buffer_location;
 	uint32_t window_id;
+	flexio_uintptr_t nvme_queue;
+	uint64_t nvme_packet_idx;
 
 	cq_ctx_t rq_cq_ctx;     /* RQ CQ */
 	rq_ctx_t rq_ctx;        /* RQ */
@@ -83,6 +89,7 @@ static void thd_ctx_init(struct host2dev_packet_processor_data *data_from_host)
 	thd_ctx[i].rq_lkey = data_from_host->rq_transf.wqd_mkey_id;
 	thd_ctx[i].buffer_location = data_from_host->buffer_location;
 	thd_ctx[i].window_id = data_from_host->window_id;
+	thd_ctx[i].nvme_packet_idx = 0;
 
 	/* Set context for RQ's CQ */
 	com_cq_ctx_init(&(thd_ctx[i].rq_cq_ctx),
@@ -131,8 +138,6 @@ static void thd_ctx_init(struct host2dev_packet_processor_data *data_from_host)
     thd_ctx[i].sq_ctx.sq_wqe_seg_idx = 0;
 }
 
-
-
 static void process_packet(struct flexio_dev_thread_ctx *dtctx, struct dpa_thread_context* thd_ctx, int use_copy)
 {
 	/* RX packet handling variables */
@@ -149,6 +154,7 @@ static void process_packet(struct flexio_dev_thread_ctx *dtctx, struct dpa_threa
 
 	/* Size of the data */
 	uint32_t data_sz;
+	uint32_t pkt_type;
 
 	/* Extract relevant data from the CQE */
 	rq_wqe_idx = flexio_dev_cqe_get_wqe_counter(thd_ctx->rq_cq_ctx.cqe);
@@ -160,23 +166,39 @@ static void process_packet(struct flexio_dev_thread_ctx *dtctx, struct dpa_threa
 	/* Extract data (whole packet) pointed to by the RQ WQE */
 	rq_data = flexio_dev_rwqe_get_addr(rwqe);
 
-	if (use_copy == 0) {
-		sq_data = rq_data;
+
+	pkt_type = *((uint32_t*)(rq_data + 42) + 1);
+	if (pkt_type == 0) {
+		if (use_copy == 0) {
+			sq_data = rq_data;
+		}
+		else {
+			/* Take the next entry from the data ring */
+			sq_data = get_next_dte(&(thd_ctx->dt_ctx), DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);	
+			/* Copy received packet to sq_data as is */
+			memcpy(sq_data, rq_data, data_sz);
+		}
+	
+		/* swap mac address */
+		swap_macs(sq_data);
+	
+		swqe = &(thd_ctx->sq_ctx.sq_ring[(thd_ctx->sq_ctx.sq_wqe_seg_idx + 2) & SQ_IDX_MASK]);
+		thd_ctx->sq_ctx.sq_wqe_seg_idx += 4;
+		flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, thd_ctx->sq_lkey, (uint64_t)sq_data);
 	}
 	else {
-		/* Take the next entry from the data ring */
-		sq_data = get_next_dte(&(thd_ctx->dt_ctx), DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);	
-		/* Copy received packet to sq_data as is */
-		memcpy(sq_data, rq_data, data_sz);
+		data_sz -= ETH_HEADER_SIZE;
+		memcpy((void*)(thd_ctx->nvme_queue + (thd_ctx->nvme_packet_idx % NVME_QUEUE_ENTRY_NUM) * NVME_QUEUE_ENTRY_SIZE), rq_data + ETH_HEADER_SIZE, data_sz > NVME_QUEUE_ENTRY_SIZE ? NVME_QUEUE_ENTRY_SIZE : data_sz);
+		
+		// memcpy((void*)(thd_ctx->nvme_queue + (thd_ctx->nvme_packet_idx % NVME_QUEUE_ENTRY_NUM) * NVME_QUEUE_ENTRY_SIZE), rq_data, NVME_QUEUE_ENTRY_SIZE);
+		thd_ctx->nvme_packet_idx++;
+	
+		__dpa_thread_window_writeback();
+	
+		swqe = &(thd_ctx->sq_ctx.sq_ring[(thd_ctx->sq_ctx.sq_wqe_seg_idx + 2) & SQ_IDX_MASK]);
+		thd_ctx->sq_ctx.sq_wqe_seg_idx += 4;
+		flexio_dev_swqe_seg_mem_ptr_data_set(swqe, ACK_MSG_SIZE, thd_ctx->sq_lkey, (uint64_t)rq_data);
 	}
-
-	/* swap mac address */
-	swap_macs(sq_data);
-
-
-	swqe = &(thd_ctx->sq_ctx.sq_ring[(thd_ctx->sq_ctx.sq_wqe_seg_idx + 2) & SQ_IDX_MASK]);
-	thd_ctx->sq_ctx.sq_wqe_seg_idx += 4;
-	flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, thd_ctx->sq_lkey, (uint64_t)sq_data);
 
 	/* Ring DB */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
@@ -209,6 +231,7 @@ static void process_packet_host(struct flexio_dev_thread_ctx *dtctx, struct dpa_
 
 	/* Size of the data */
 	uint32_t data_sz;
+	uint32_t pkt_type;
 
 	/* Extract relevant data from the CQE */
 	rq_wqe_idx = flexio_dev_cqe_get_wqe_counter(thd_ctx->rq_cq_ctx.cqe);
@@ -221,25 +244,40 @@ static void process_packet_host(struct flexio_dev_thread_ctx *dtctx, struct dpa_
 	rq_data_host = flexio_dev_rwqe_get_addr(rwqe);
 	rq_data_dpa = get_dpa_host_rq_data_addr(rq_data_host, thd_ctx);
 
-	if (use_copy == 0) {
-		sq_data_host = rq_data_host;
-		sq_data_dpa = rq_data_dpa;
+	pkt_type = *((uint32_t*)(rq_data_dpa + 42) + 1);
+	if (pkt_type == 0) {
+		if (use_copy == 0) {
+			sq_data_host = rq_data_host;
+			sq_data_dpa = rq_data_dpa;
+		}
+		else {
+			sq_data_host = get_next_dte(&(thd_ctx->dt_ctx), DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+			sq_data_dpa = get_dpa_host_sq_data_addr(sq_data_host, thd_ctx);
+			memcpy(sq_data_dpa, rq_data_dpa, data_sz);
+		}
+	
+		/* swap mac address */
+		swap_macs(sq_data_dpa);
+	
+		__dpa_thread_window_writeback();
+	
+		swqe = &(thd_ctx->sq_ctx.sq_ring[(thd_ctx->sq_ctx.sq_wqe_seg_idx + 2) & SQ_IDX_MASK]);
+		thd_ctx->sq_ctx.sq_wqe_seg_idx += 4;
+		flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, thd_ctx->sq_lkey, (uint64_t)sq_data_host);
 	}
 	else {
-		sq_data_host = get_next_dte(&(thd_ctx->dt_ctx), DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
-		sq_data_dpa = get_dpa_host_sq_data_addr(sq_data_host, thd_ctx);
-		memcpy(sq_data_dpa, rq_data_dpa, data_sz);
+		data_sz -= ETH_HEADER_SIZE;
+		memcpy((void*)(thd_ctx->nvme_queue + (thd_ctx->nvme_packet_idx % NVME_QUEUE_ENTRY_NUM) * NVME_QUEUE_ENTRY_SIZE), rq_data_dpa + ETH_HEADER_SIZE, data_sz > NVME_QUEUE_ENTRY_SIZE ? NVME_QUEUE_ENTRY_SIZE : data_sz);
+		// memcpy((void*)(thd_ctx->nvme_queue + (thd_ctx->nvme_packet_idx % NVME_QUEUE_ENTRY_NUM) * NVME_QUEUE_ENTRY_SIZE), rq_data_dpa, NVME_QUEUE_ENTRY_SIZE);
+		thd_ctx->nvme_packet_idx++;
+
+		__dpa_thread_window_writeback();
+
+		swqe = &(thd_ctx->sq_ctx.sq_ring[(thd_ctx->sq_ctx.sq_wqe_seg_idx + 2) & SQ_IDX_MASK]);
+		thd_ctx->sq_ctx.sq_wqe_seg_idx += 4;
+		flexio_dev_swqe_seg_mem_ptr_data_set(swqe, ACK_MSG_SIZE, thd_ctx->sq_lkey, (uint64_t)rq_data_host);
 	}
 
-	/* swap mac address */
-	swap_macs(sq_data_dpa);
-
-	__dpa_thread_window_writeback();
-
-	swqe = &(thd_ctx->sq_ctx.sq_ring[(thd_ctx->sq_ctx.sq_wqe_seg_idx + 2) & SQ_IDX_MASK]);
-	thd_ctx->sq_ctx.sq_wqe_seg_idx += 4;
-	flexio_dev_swqe_seg_mem_ptr_data_set(swqe, data_sz, thd_ctx->sq_lkey, (uint64_t)sq_data_host);
-	
 	/* Ring DB */
 	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
 	flexio_dev_qp_sq_ring_db(++thd_ctx->sq_ctx.sq_pi, thd_ctx->sq_ctx.sq_number);
@@ -262,9 +300,9 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 	flexio_uintptr_t result = 0;
 
 	flexio_dev_get_thread_ctx(&dtctx);
+	flexio_dev_print("start thread %d %d\n", i, buffer_location);
 
 	if (!data_from_host->not_first_run) {
-		flexio_dev_print("start thread %d %d\n", i, buffer_location);
 		thd_ctx_init(data_from_host);
 		if (buffer_location == 0) {
 			thd_ctx[i].rq_ctx.rqd_dpa_addr = data_from_host->rq_transf.wqd_daddr;
@@ -278,6 +316,10 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 			if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
 				flexio_dev_print("failed to acquire result ptr, thread %d\n", i);
 				// while(1);
+			}
+			ret = flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0, (uint64_t)(data_from_host->nvme_queue), &(thd_ctx[i].nvme_queue));
+			if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
+				flexio_dev_print("failed to acquire result ptr, thread %d\n", i);
 			}
 		}
 		else {
@@ -305,6 +347,10 @@ __dpa_global__ void flexio_pp_dev(uint64_t thread_arg)
 			if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
 				flexio_dev_print("failed to acquire result ptr, thread %d\n", i);
 				// while(1);
+			}
+			ret = flexio_dev_window_ptr_acquire(FLEXIO_DEV_WINDOW_ENTITY_0, (uint64_t)(data_from_host->nvme_queue), &(thd_ctx[i].nvme_queue));
+			if (ret != FLEXIO_DEV_STATUS_SUCCESS) {
+				flexio_dev_print("failed to acquire result ptr, thread %d\n", i);
 			}
 			// flexio_dev_print("after host addr: 0x%llx, dpa addr: 0x%llx\n", data_from_host->result_buffer, result);	
 		}

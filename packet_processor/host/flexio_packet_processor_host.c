@@ -96,6 +96,7 @@ struct thread_context {
 	uint32_t result_buffer_mkey_id;
 	void* result_buffer;
 
+	void* nvme_queue;
 
 	int thd_id;
 };
@@ -649,6 +650,7 @@ static int copy_app_data_to_dpa(struct app_context *app_ctx, struct thread_conte
 	}
 	h2d_data->result_buffer_mkey_id = thd_ctx->result_buffer_mkey_id;
 	h2d_data->result_buffer = thd_ctx->result_buffer;
+	h2d_data->nvme_queue = thd_ctx->nvme_queue;
 
 	/* Copy to DPA heap memory.
 	 * Allocated DPA heap memory address will be kept in app_data_daddr.
@@ -983,7 +985,6 @@ int main(int argc, char **argv)
 		struct mlx5dv_flow_match_parameters *match_value = 0;
 		int match_value_size;
 		uint64_t cur_dmac = DMAC + begin_thread + i;
-		// uint64_t cur_dmac = DMAC;
 		printf("%lx\n", cur_dmac);
 
         handler_attr.host_stub_func = flexio_pp_dev;
@@ -997,7 +998,7 @@ int main(int argc, char **argv)
 		}
 		if (buffer_location == 0) {
 			void* tmp_ptr = NULL;
-			size_t needed_buffer_size = SPEED_RESULT_SIZE;
+			size_t needed_buffer_size = SPEED_RESULT_SIZE + NVME_QUEUE_MEMORY_SIZE;
 			size_t mmap_size = needed_buffer_size + (64 - 1);
 			mmap_size -= mmap_size % 64;
 			tmp_ptr = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -1013,10 +1014,11 @@ int main(int argc, char **argv)
 			}
 			thd_ctx[i].result_buffer_mkey_id = thd_ctx[i].mr->lkey;
 			thd_ctx[i].result_buffer = (char*)tmp_ptr;
+			thd_ctx[i].nvme_queue = (char*)tmp_ptr + SPEED_RESULT_SIZE;
 		}
 		else {
 			void* tmp_ptr = NULL;
-			size_t needed_buffer_size = 2 * Q_DATA_BSIZE + SPEED_RESULT_SIZE;
+			size_t needed_buffer_size = 2 * Q_DATA_BSIZE + SPEED_RESULT_SIZE + NVME_QUEUE_MEMORY_SIZE;
 			size_t mmap_size = needed_buffer_size + (64 - 1);
 			mmap_size -= mmap_size % 64;
 			tmp_ptr = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
@@ -1036,6 +1038,7 @@ int main(int argc, char **argv)
 			rqd_daddr_mkey_id = thd_ctx[i].mr->lkey;
 			thd_ctx[i].result_buffer_mkey_id = thd_ctx[i].mr->lkey;
 			thd_ctx[i].result_buffer = (char*)tmp_ptr + 2 * Q_DATA_BSIZE;
+			thd_ctx[i].nvme_queue = (char*)tmp_ptr + 2 * Q_DATA_BSIZE + SPEED_RESULT_SIZE;
 		}
 
 		if (create_app_rq(&(app_ctx), &(thd_ctx[i]), buffer_location, rqd_daddr_if_buffer_on_host, rqd_daddr_mkey_id)) {
@@ -1125,6 +1128,10 @@ int main(int argc, char **argv)
 			err = -1;
 			goto cleanup;
 		}
+
+	}
+
+	while(1) {
 
 	}
 

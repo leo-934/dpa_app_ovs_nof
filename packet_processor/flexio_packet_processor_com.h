@@ -48,6 +48,10 @@
 
 #define SPEED_RESULT_SIZE 8
 
+#define NVME_QUEUE_ENTRY_SIZE (64)
+#define NVME_QUEUE_ENTRY_NUM (128)
+#define NVME_QUEUE_MEMORY_SIZE (NVME_QUEUE_ENTRY_SIZE * NVME_QUEUE_ENTRY_NUM)
+
 /* Structure for transfer CQ data */
 struct app_transfer_cq {
 	/* CQ number */
@@ -92,6 +96,7 @@ struct host2dev_packet_processor_data {
 	uint32_t window_id;
 	uint32_t result_buffer_mkey_id;
 	void* result_buffer;
+	void* nvme_queue;
 } __attribute__((__packed__, aligned(8)));
 
 struct host_to_device_config {

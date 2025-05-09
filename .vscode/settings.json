@@ -9,6 +9,5 @@
         "string_view": "c",
         "mman.h": "c",
         "functional": "c"
-    },
-    "mesonbuild.configureOnOpen": false
+    }
 }
